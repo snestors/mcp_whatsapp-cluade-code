@@ -1,0 +1,10 @@
+{
+  "authorized_numbers": [
+    "51922743968"
+  ],
+  "qr_port": 3456,
+  "api_port": 3457,
+  "chromium_path": "/usr/bin/chromium",
+  "auth_path": "/home/nestor/.wwebjs_auth",
+  "db_path": "/media/usb/mcp-whatsapp/messages.db"
+}
