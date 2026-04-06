@@ -21,7 +21,7 @@ async function api(path, options = {}) {
   return res.json();
 }
 
-const server = new McpServer({ name: "whatsapp", version: "2.0.0" });
+const server = new McpServer({ name: "whatsapp", version: "2.1.0" });
 
 server.tool("send_message", "Send a WhatsApp message to a phone number", {
   phone: z.string().describe("Phone with country code e.g. 51922743968"),

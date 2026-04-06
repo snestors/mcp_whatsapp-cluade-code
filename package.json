@@ -1,7 +1,7 @@
 {
   "name": "mcp-whatsapp",
-  "version": "2.0.0",
-  "description": "WhatsApp MCP server for Claude Code with Bridge service",
+  "version": "2.1.0",
+  "description": "WhatsApp MCP server for Claude Code with Bridge service and auto-response",
   "type": "module",
   "scripts": {
     "bridge": "node bridge.cjs",
@@ -9,8 +9,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "^12.8.0",
     "express": "^4.21.0",
-    "whatsapp-web.js": "^1.34.6"
+    "whatsapp-web.js": "^1.34.6",
+    "zod": "^3.23.0"
   }
 }

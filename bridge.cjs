@@ -7,13 +7,16 @@
  * - Stores all messages in SQLite
  * - Only processes messages from authorized numbers
  * - QR code web page for initial pairing
+ * - Auto-response via Claude CLI with persistent sessions
  */
 
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const express = require("express");
 const Database = require("better-sqlite3");
-const { readFileSync } = require("fs");
+const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve } = require("path");
+const { spawn } = require("child_process");
+const os = require("os");
 
 // --- Config ---
 const CONFIG_PATH = process.env.WA_CONFIG || resolve(__dirname, "config.json");
@@ -23,8 +26,17 @@ const AUTHORIZED = new Set(config.authorized_numbers || []);
 const QR_PORT = config.qr_port || 3456;
 const API_PORT = config.api_port || 3457;
 const CHROMIUM_PATH = config.chromium_path || "/usr/bin/chromium";
-const AUTH_PATH = config.auth_path || "/home/nestor/.wwebjs_auth";
-const DB_PATH = config.db_path || "/media/usb/mcp-whatsapp/messages.db";
+
+// Resolve ~ in paths
+function resolvePath(p, fallback) {
+  const val = p || fallback;
+  if (val.startsWith("~")) return resolve(os.homedir(), val.slice(2));
+  return resolve(val);
+}
+
+const AUTH_PATH = resolvePath(config.auth_path, "~/.wwebjs_auth");
+const DB_PATH = resolvePath(config.db_path, "./messages.db");
+const MEDIA_DIR = resolvePath(config.media_path, "./media");
 
 // --- Database ---
 const db = new Database(DB_PATH);
@@ -59,15 +71,14 @@ const stmtRecent = db.prepare(
 
 function extractPhone(jid) {
   if (!jid) return null;
-  // Handle both @c.us and @lid formats
   return jid.split("@")[0];
 }
 
-function isAuthorized(jid) {
-  if (AUTHORIZED.size === 0) return true; // no whitelist = allow all
-  const phone = extractPhone(jid);
+function isAuthorized(jid, resolvedPhone) {
+  if (AUTHORIZED.size === 0) return true;
   for (const num of AUTHORIZED) {
-    if (jid.includes(num) || (phone && phone.includes(num))) return true;
+    if (resolvedPhone && resolvedPhone.includes(num)) return true;
+    if (jid.includes(num)) return true;
   }
   return false;
 }
@@ -76,7 +87,7 @@ function isAuthorized(jid) {
 let waClient = null;
 let isReady = false;
 let currentQR = null;
-let jidMap = {}; // maps phone numbers to JIDs for sending
+let jidMap = {};
 
 console.log("[bridge] Starting WhatsApp client...");
 
@@ -118,33 +129,214 @@ waClient.on("auth_failure", (msg) => {
 waClient.on("disconnected", (reason) => {
   isReady = false;
   console.log("[bridge] Disconnected:", reason);
-  // Auto-reconnect
   setTimeout(() => {
     console.log("[bridge] Reconnecting...");
     waClient.initialize().catch((e) => console.error("[bridge] Reconnect error:", e.message));
   }, 5000);
 });
 
-waClient.on("message", (msg) => {
+waClient.on("message", async (msg) => {
   const jid = msg.from;
-  const phone = extractPhone(jid);
-  const name = msg._data.notifyName || phone || jid;
+  const name = msg._data.notifyName || jid;
   const body = msg.body || "";
   const timestamp = new Date(msg.timestamp * 1000).toISOString();
-  const authorized = isAuthorized(jid);
 
-  // Store JID mapping
+  // Resolve real phone number from contact (handles @lid JIDs)
+  let phone = null;
+  try {
+    const contact = await msg.getContact();
+    phone = contact.number || extractPhone(jid);
+  } catch {
+    phone = extractPhone(jid);
+  }
+
+  const authorized = isAuthorized(jid, phone);
+
   if (phone) jidMap[phone] = jid;
 
-  // Always store in DB
-  stmtInsert.run(jid, phone, name, body, timestamp, 0, authorized ? 0 : 1);
+  // Mark as seen (double blue check)
+  try {
+    const chat = await msg.getChat();
+    await chat.sendSeen();
+  } catch {}
+
+  // Handle media (photos, files, audio)
+  let mediaDescription = "";
+  if (msg.hasMedia) {
+    try {
+      const media = await msg.downloadMedia();
+      if (media) {
+        const ext = media.mimetype.split("/")[1] || "bin";
+        const filename = `media_${Date.now()}.${ext}`;
+        const mediaPath = resolve(MEDIA_DIR, filename);
+        mkdirSync(MEDIA_DIR, { recursive: true });
+        require("fs").writeFileSync(mediaPath, media.data, "base64");
+        mediaDescription = ` [Archivo adjunto: ${media.mimetype}, guardado en ${mediaPath}]`;
+        console.log(`[bridge] Media saved: ${mediaPath}`);
+      }
+    } catch (e) {
+      mediaDescription = ` [Archivo adjunto no descargable: ${e.message}]`;
+    }
+  }
+
+  // Handle quoted message (reply context)
+  let quotedContext = "";
+  if (msg.hasQuotedMsg) {
+    try {
+      const quoted = await msg.getQuotedMessage();
+      quotedContext = ` [En respuesta a: "${(quoted.body || "").substring(0, 200)}"]`;
+    } catch {}
+  }
+
+  const fullBody = body + mediaDescription + quotedContext;
+  stmtInsert.run(jid, phone, name, fullBody, timestamp, 0, authorized ? 0 : 1);
 
   if (authorized) {
-    console.log(`[bridge] Message from ${name}: ${body.substring(0, 80)}`);
+    console.log(`[bridge] Message from ${name} (${phone}): ${fullBody.substring(0, 100)}`);
+
+    // Special commands
+    if (body.trim().toLowerCase() === "/reset") {
+      activeSession = null;
+      try { require("fs").unlinkSync(SESSION_FILE); } catch {}
+      await waClient.sendMessage(jid, "Sesion reseteada. El proximo mensaje inicia conversacion nueva.");
+      return;
+    }
+
+    if (config.auto_respond !== false) {
+      handleAutoResponse(msg, jid, phone, name, fullBody);
+    }
   } else {
-    console.log(`[bridge] Ignored message from unauthorized ${phone}`);
+    console.log(`[bridge] Ignored message from unauthorized ${phone} (${jid})`);
   }
 });
+
+// --- Auto-response via Claude CLI ---
+const SESSION_FILE = resolve(__dirname, ".wa_session_id");
+const SYSTEM_PROMPT = resolve(__dirname, "system-prompt.md");
+let activeSession = existsSync(SESSION_FILE) ? readFileSync(SESSION_FILE, "utf-8").trim() : null;
+const messageQueue = [];
+let processing = false;
+
+async function handleAutoResponse(originalMsg, jid, phone, name, body) {
+  messageQueue.push({ originalMsg, jid, phone, name, body });
+  if (!processing) processQueue();
+}
+
+async function processQueue() {
+  if (messageQueue.length === 0) { processing = false; return; }
+  processing = true;
+  const { originalMsg, jid, phone, name, body } = messageQueue.shift();
+
+  let chat;
+  let typingInterval;
+  let typingTimeout;
+  const TYPING_MAX_SECONDS = config.typing_timeout || 120;
+  try {
+    chat = await originalMsg.getChat();
+    await chat.sendStateTyping();
+    typingInterval = setInterval(async () => {
+      try { await chat.sendStateTyping(); } catch {}
+    }, 10000);
+    typingTimeout = setTimeout(() => {
+      clearInterval(typingInterval);
+      typingInterval = null;
+      try { chat.clearState(); } catch {}
+      console.log("[bridge] Typing timeout reached, still waiting for Claude...");
+    }, TYPING_MAX_SECONDS * 1000);
+  } catch {}
+
+  try {
+    let prompt = `[WhatsApp de ${name}]: ${body}`;
+
+    const args = ["-p", "--model", "opus", "--dangerously-skip-permissions"];
+    if (activeSession) {
+      args.push("--resume", activeSession);
+    } else {
+      const sysPrompt = existsSync(SYSTEM_PROMPT) ? readFileSync(SYSTEM_PROMPT, "utf-8") : "";
+      if (sysPrompt) {
+        prompt = `CONTEXTO DEL SISTEMA:\n${sysPrompt}\n\n---\n\n${prompt}`;
+      }
+    }
+    args.push("--output-format", "json");
+    args.push(prompt);
+
+    console.log(`[bridge] Calling Claude (opus)...`);
+
+    const homeDir = os.homedir();
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn("claude", args, {
+        cwd: homeDir,
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (d) => { stdout += d.toString(); });
+      proc.stderr.on("data", (d) => { stderr += d.toString(); });
+      proc.on("close", (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Exit ${code}: ${stderr || stdout}`));
+      });
+      proc.on("error", reject);
+    });
+
+    let response, sessionId;
+    try {
+      const parsed = JSON.parse(result);
+      response = parsed.result || result;
+      sessionId = parsed.session_id;
+    } catch {
+      response = result.trim();
+    }
+
+    if (sessionId) {
+      activeSession = sessionId;
+      writeFileSync(SESSION_FILE, sessionId);
+    }
+
+    if (typingInterval) clearInterval(typingInterval);
+    if (typingTimeout) clearTimeout(typingTimeout);
+    try { await chat.clearState(); } catch {}
+
+    const alreadySent = !response || response.trim().toLowerCase() === "ok" || response.trim().length < 5;
+    if (!alreadySent && response.length > 0) {
+      const maxLen = 4000;
+      const chunks = [];
+      let remaining = response;
+      while (remaining.length > 0) {
+        if (remaining.length <= maxLen) { chunks.push(remaining); break; }
+        let splitAt = remaining.lastIndexOf("\n", maxLen);
+        if (splitAt < maxLen / 2) splitAt = maxLen;
+        chunks.push(remaining.substring(0, splitAt));
+        remaining = remaining.substring(splitAt).trimStart();
+      }
+
+      for (const chunk of chunks) {
+        await waClient.sendMessage(jid, chunk);
+        if (chunks.length > 1) await new Promise(r => setTimeout(r, 500));
+      }
+
+      stmtInsert.run(jid, phone, "Claude", response, new Date().toISOString(), 1, 1);
+      console.log(`[bridge] Responded (${response.length} chars): ${response.substring(0, 80)}...`);
+    } else {
+      console.log("[bridge] Claude already sent response via MCP, skipping duplicate.");
+    }
+  } catch (err) {
+    if (typingInterval) clearInterval(typingInterval);
+    if (typingTimeout) clearTimeout(typingTimeout);
+    console.error("[bridge] Claude CLI error:", err.message);
+    try { await chat.clearState(); } catch {}
+
+    if (err.message.includes("session") || err.message.includes("resume") || err.message.includes("not found")) {
+      console.log("[bridge] Resetting session...");
+      activeSession = null;
+      try { require("fs").unlinkSync(SESSION_FILE); } catch {}
+    }
+  }
+
+  processQueue();
+}
 
 // --- QR Web Server ---
 const qrApp = express();
@@ -213,13 +405,9 @@ api.post("/send", async (req, res) => {
     return res.status(503).json({ error: "WhatsApp not connected" });
   }
   try {
-    // Try to find the JID from the map, or construct it
     let chatId = jidMap[phone] || `${phone}@c.us`;
     await waClient.sendMessage(chatId, message);
-
-    // Store sent message in DB
     stmtInsert.run(chatId, phone, "me", message, new Date().toISOString(), 1, 1);
-
     res.json({ ok: true, sent_to: phone });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -252,18 +440,14 @@ startWhatsApp();
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("[bridge] Shutting down...");
-  try {
-    await waClient.destroy();
-  } catch (e) {}
+  try { await waClient.destroy(); } catch (e) {}
   db.close();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   console.log("[bridge] Interrupted.");
-  try {
-    await waClient.destroy();
-  } catch (e) {}
+  try { await waClient.destroy(); } catch (e) {}
   db.close();
   process.exit(0);
 });
