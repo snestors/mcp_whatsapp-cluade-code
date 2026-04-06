@@ -75,16 +75,39 @@ Eso es todo. Claude Code hace el resto.
 ## Arquitectura
 
 ```
-WhatsApp ←→ bridge.cjs (systemd, siempre corriendo)
-                |
-                ├── Chromium + whatsapp-web.js (conexion WA)
-                ├── Express API :3457 (send/receive)
-                ├── SQLite (historial mensajes)
-                ├── QR web :3456 (vincular telefono)
-                └── claude CLI --resume (auto-respuesta con contexto)
-
-index.js (MCP liviano) ←→ bridge API :3457 ←→ Claude Code
+                              +-----------------------+
+                              |     Claude Code       |
+                              |  (usa tools MCP)      |
+                              +----------+------------+
+                                         |
+                                    stdio (MCP)
+                                         |
+                              +----------v------------+
+                              |   index.js (MCP)      |
+                              |   Liviano, sin estado  |
+                              +----------+------------+
+                                         |
+                                   HTTP :3457
+                                         |
++-------------+           +--------------v--------------+          +-------------+
+|  WhatsApp   | <-------> |     bridge.cjs (systemd)    | -------> | Claude CLI  |
+|  (telefono) |  wwebjs   |  Chromium + SQLite + Express|  spawn   | --resume    |
++-------------+           |  QR server :3456            |          +------+------+
+                          +-----------------------------+                 |
+                                         |                          Responde por
+                                         |                          send_message
+                                    +----v----+                     (via MCP)
+                                    | SQLite  |
+                                    | messages|
+                                    +---------+
 ```
+
+**Flujo de auto-respuesta:**
+1. Llega mensaje de WhatsApp al Bridge
+2. Bridge muestra "escribiendo..." y llama a `claude -p --resume <session>`
+3. Claude procesa con el system prompt y herramientas MCP disponibles
+4. La respuesta se envia de vuelta por WhatsApp
+5. La sesion persiste entre mensajes (contexto continuo)
 
 ## Notas Raspberry Pi
 
