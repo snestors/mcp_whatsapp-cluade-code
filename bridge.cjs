@@ -7,7 +7,6 @@
  * - Stores all messages in SQLite
  * - Only processes messages from authorized numbers
  * - QR code web page for initial pairing
- * - Auto-response via Claude CLI with persistent sessions
  */
 
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -15,8 +14,7 @@ const express = require("express");
 const Database = require("better-sqlite3");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve } = require("path");
-const { spawn } = require("child_process");
-const os = require("os");
+const { spawn, execFileSync } = require("child_process");
 
 // --- Config ---
 const CONFIG_PATH = process.env.WA_CONFIG || resolve(__dirname, "config.json");
@@ -26,17 +24,8 @@ const AUTHORIZED = new Set(config.authorized_numbers || []);
 const QR_PORT = config.qr_port || 3456;
 const API_PORT = config.api_port || 3457;
 const CHROMIUM_PATH = config.chromium_path || "/usr/bin/chromium";
-
-// Resolve ~ in paths
-function resolvePath(p, fallback) {
-  const val = p || fallback;
-  if (val.startsWith("~")) return resolve(os.homedir(), val.slice(2));
-  return resolve(val);
-}
-
-const AUTH_PATH = resolvePath(config.auth_path, "~/.wwebjs_auth");
-const DB_PATH = resolvePath(config.db_path, "./messages.db");
-const MEDIA_DIR = resolvePath(config.media_path, "./media");
+const AUTH_PATH = config.auth_path || "/home/nestor/.wwebjs_auth";
+const DB_PATH = config.db_path || "/media/usb/mcp-whatsapp/messages.db";
 
 // --- Database ---
 const db = new Database(DB_PATH);
@@ -71,11 +60,12 @@ const stmtRecent = db.prepare(
 
 function extractPhone(jid) {
   if (!jid) return null;
+  // Handle both @c.us and @lid formats
   return jid.split("@")[0];
 }
 
 function isAuthorized(jid, resolvedPhone) {
-  if (AUTHORIZED.size === 0) return true;
+  if (AUTHORIZED.size === 0) return true; // no whitelist = allow all
   for (const num of AUTHORIZED) {
     if (resolvedPhone && resolvedPhone.includes(num)) return true;
     if (jid.includes(num)) return true;
@@ -87,7 +77,7 @@ function isAuthorized(jid, resolvedPhone) {
 let waClient = null;
 let isReady = false;
 let currentQR = null;
-let jidMap = {};
+let jidMap = {}; // maps phone numbers to JIDs for sending
 
 console.log("[bridge] Starting WhatsApp client...");
 
@@ -129,6 +119,7 @@ waClient.on("auth_failure", (msg) => {
 waClient.on("disconnected", (reason) => {
   isReady = false;
   console.log("[bridge] Disconnected:", reason);
+  // Auto-reconnect
   setTimeout(() => {
     console.log("[bridge] Reconnecting...");
     waClient.initialize().catch((e) => console.error("[bridge] Reconnect error:", e.message));
@@ -152,6 +143,7 @@ waClient.on("message", async (msg) => {
 
   const authorized = isAuthorized(jid, phone);
 
+  // Store JID mapping
   if (phone) jidMap[phone] = jid;
 
   // Mark as seen (double blue check)
@@ -166,13 +158,32 @@ waClient.on("message", async (msg) => {
     try {
       const media = await msg.downloadMedia();
       if (media) {
-        const ext = media.mimetype.split("/")[1] || "bin";
+        // Clean extension: "ogg; codecs=opus" -> "ogg"
+        const rawExt = media.mimetype.split("/")[1] || "bin";
+        const ext = rawExt.split(";")[0].trim();
         const filename = `media_${Date.now()}.${ext}`;
-        const mediaPath = resolve(MEDIA_DIR, filename);
-        mkdirSync(MEDIA_DIR, { recursive: true });
+        const mediaPath = resolve(__dirname, "media", filename);
+        require("fs").mkdirSync(resolve(__dirname, "media"), { recursive: true });
         require("fs").writeFileSync(mediaPath, media.data, "base64");
         mediaDescription = ` [Archivo adjunto: ${media.mimetype}, guardado en ${mediaPath}]`;
         console.log(`[bridge] Media saved: ${mediaPath}`);
+
+        // Auto-transcribe audio messages
+        if (media.mimetype.startsWith("audio/")) {
+          try {
+            const transcription = execFileSync(
+              "/media/usb/whisper.cpp/transcribe.sh",
+              [mediaPath, "es"],
+              { timeout: 30000, encoding: "utf-8" }
+            ).trim();
+            if (transcription && !transcription.startsWith("Error")) {
+              mediaDescription = ` [Nota de voz transcrita: "${transcription}"]`;
+              console.log(`[bridge] Transcribed audio: ${transcription.substring(0, 80)}`);
+            }
+          } catch (e) {
+            console.error(`[bridge] Transcription failed: ${e.message}`);
+          }
+        }
       }
     } catch (e) {
       mediaDescription = ` [Archivo adjunto no descargable: ${e.message}]`;
@@ -188,6 +199,7 @@ waClient.on("message", async (msg) => {
     } catch {}
   }
 
+  // Always store in DB
   const fullBody = body + mediaDescription + quotedContext;
   stmtInsert.run(jid, phone, name, fullBody, timestamp, 0, authorized ? 0 : 1);
 
@@ -230,13 +242,14 @@ async function processQueue() {
   let chat;
   let typingInterval;
   let typingTimeout;
-  const TYPING_MAX_SECONDS = config.typing_timeout || 120;
+  const TYPING_MAX_SECONDS = config.typing_timeout || 120; // max 2 min typing
   try {
     chat = await originalMsg.getChat();
     await chat.sendStateTyping();
     typingInterval = setInterval(async () => {
       try { await chat.sendStateTyping(); } catch {}
     }, 10000);
+    // Auto-stop typing after limit
     typingTimeout = setTimeout(() => {
       clearInterval(typingInterval);
       typingInterval = null;
@@ -246,8 +259,10 @@ async function processQueue() {
   } catch {}
 
   try {
+    // Build prompt
     let prompt = `[WhatsApp de ${name}]: ${body}`;
 
+    // Build claude args
     const args = ["-p", "--model", "opus", "--dangerously-skip-permissions"];
     if (activeSession) {
       args.push("--resume", activeSession);
@@ -262,11 +277,11 @@ async function processQueue() {
 
     console.log(`[bridge] Calling Claude (opus)...`);
 
-    const homeDir = os.homedir();
+    // Use spawn for async execution
     const result = await new Promise((resolve, reject) => {
       const proc = spawn("claude", args, {
-        cwd: homeDir,
-        env: { ...process.env, HOME: homeDir },
+        cwd: "/home/nestor",
+        env: { ...process.env, HOME: "/home/nestor" },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -281,6 +296,7 @@ async function processQueue() {
       proc.on("error", reject);
     });
 
+    // Parse response
     let response, sessionId;
     try {
       const parsed = JSON.parse(result);
@@ -290,15 +306,19 @@ async function processQueue() {
       response = result.trim();
     }
 
+    // Save session ID
     if (sessionId) {
       activeSession = sessionId;
       writeFileSync(SESSION_FILE, sessionId);
     }
 
+    // Stop typing
     if (typingInterval) clearInterval(typingInterval);
     if (typingTimeout) clearTimeout(typingTimeout);
     try { await chat.clearState(); } catch {}
 
+    // Only send response if Claude didn't already send via MCP
+    // (if result is just "OK" or very short, Claude already sent via send_message)
     const alreadySent = !response || response.trim().toLowerCase() === "ok" || response.trim().length < 5;
     if (!alreadySent && response.length > 0) {
       const maxLen = 4000;
@@ -405,9 +425,13 @@ api.post("/send", async (req, res) => {
     return res.status(503).json({ error: "WhatsApp not connected" });
   }
   try {
+    // Try to find the JID from the map, or construct it
     let chatId = jidMap[phone] || `${phone}@c.us`;
     await waClient.sendMessage(chatId, message);
+
+    // Store sent message in DB
     stmtInsert.run(chatId, phone, "me", message, new Date().toISOString(), 1, 1);
+
     res.json({ ok: true, sent_to: phone });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -440,14 +464,18 @@ startWhatsApp();
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("[bridge] Shutting down...");
-  try { await waClient.destroy(); } catch (e) {}
+  try {
+    await waClient.destroy();
+  } catch (e) {}
   db.close();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   console.log("[bridge] Interrupted.");
-  try { await waClient.destroy(); } catch (e) {}
+  try {
+    await waClient.destroy();
+  } catch (e) {}
   db.close();
   process.exit(0);
 });
