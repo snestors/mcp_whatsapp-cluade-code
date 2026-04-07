@@ -9,7 +9,7 @@
  * - QR code web page for initial pairing
  */
 
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const express = require("express");
 const Database = require("better-sqlite3");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
@@ -25,7 +25,7 @@ const QR_PORT = config.qr_port || 3456;
 const API_PORT = config.api_port || 3457;
 const CHROMIUM_PATH = config.chromium_path || "/usr/bin/chromium";
 const AUTH_PATH = config.auth_path || "/home/nestor/.wwebjs_auth";
-const DB_PATH = config.db_path || "/media/usb/mcp-whatsapp/messages.db";
+const DB_PATH = config.db_path || "/media/hdd/mcp-whatsapp/messages.db";
 
 // --- Database ---
 const db = new Database(DB_PATH);
@@ -172,7 +172,7 @@ waClient.on("message", async (msg) => {
         if (media.mimetype.startsWith("audio/")) {
           try {
             const transcription = execFileSync(
-              "/media/usb/whisper.cpp/transcribe.sh",
+              "/media/hdd/whisper.cpp/transcribe.sh",
               [mediaPath, "es"],
               { timeout: 30000, encoding: "utf-8" }
             ).trim();
@@ -207,10 +207,41 @@ waClient.on("message", async (msg) => {
     console.log(`[bridge] Message from ${name} (${phone}): ${fullBody.substring(0, 100)}`);
 
     // Special commands
-    if (body.trim().toLowerCase() === "/reset") {
+    const cmd = body.trim().toLowerCase();
+
+    if (cmd === "/reset") {
+      // Kill running Claude process if any
+      if (currentClaudeProc) {
+        try { currentClaudeProc.kill("SIGTERM"); } catch {}
+        currentClaudeProc = null;
+      }
       activeSession = null;
+      processing = false;
+      messageQueue.length = 0;
+      currentTaskStarted = null;
+      currentTaskPrompt = null;
       try { require("fs").unlinkSync(SESSION_FILE); } catch {}
-      await waClient.sendMessage(jid, "Sesion reseteada. El proximo mensaje inicia conversacion nueva.");
+      await waClient.sendMessage(jid, "🔄 Reset completo:\n- Sesión de Claude eliminada\n- Proceso activo terminado\n- Cola de mensajes limpia\n\nEl próximo mensaje inicia conversación nueva.");
+      return;
+    }
+
+    if (cmd === "/status") {
+      const uptime = process.uptime();
+      const h = Math.floor(uptime / 3600);
+      const m = Math.floor((uptime % 3600) / 60);
+      let status = `📊 *Bridge Status*\n`;
+      status += `• Uptime: ${h}h ${m}m\n`;
+      status += `• Sesión activa: ${activeSession ? "sí" : "no"}\n`;
+      status += `• Cola de mensajes: ${messageQueue.length} pendientes\n`;
+      if (processing && currentTaskStarted) {
+        const elapsed = Math.round((Date.now() - currentTaskStarted) / 1000);
+        status += `• ⏳ *Procesando* (${elapsed}s):\n  "${(currentTaskPrompt || "").substring(0, 100)}"\n`;
+        status += `• PID Claude: ${currentClaudeProc?.pid || "N/A"}`;
+      } else {
+        status += `• Idle (sin proceso activo)`;
+      }
+      await waClient.sendMessage(jid, status);
+      stmtInsert.run(jid, phone, "me", status, new Date().toISOString(), 1, 1);
       return;
     }
 
@@ -228,6 +259,9 @@ const SYSTEM_PROMPT = resolve(__dirname, "system-prompt.md");
 let activeSession = existsSync(SESSION_FILE) ? readFileSync(SESSION_FILE, "utf-8").trim() : null;
 const messageQueue = [];
 let processing = false;
+let currentClaudeProc = null;
+let currentTaskStarted = null;
+let currentTaskPrompt = null;
 
 async function handleAutoResponse(originalMsg, jid, phone, name, body) {
   messageQueue.push({ originalMsg, jid, phone, name, body });
@@ -276,6 +310,8 @@ async function processQueue() {
     args.push(prompt);
 
     console.log(`[bridge] Calling Claude (opus)...`);
+    currentTaskStarted = Date.now();
+    currentTaskPrompt = body;
 
     // Use spawn for async execution
     const result = await new Promise((resolve, reject) => {
@@ -284,23 +320,32 @@ async function processQueue() {
         env: { ...process.env, HOME: "/home/nestor" },
         stdio: ["ignore", "pipe", "pipe"],
       });
+      currentClaudeProc = proc;
 
       let stdout = "";
       let stderr = "";
       proc.stdout.on("data", (d) => { stdout += d.toString(); });
       proc.stderr.on("data", (d) => { stderr += d.toString(); });
       proc.on("close", (code) => {
+        currentClaudeProc = null;
+        currentTaskStarted = null;
+        currentTaskPrompt = null;
         if (code === 0) resolve(stdout);
         else reject(new Error(`Exit ${code}: ${stderr || stdout}`));
       });
-      proc.on("error", reject);
+      proc.on("error", (err) => {
+        currentClaudeProc = null;
+        currentTaskStarted = null;
+        currentTaskPrompt = null;
+        reject(err);
+      });
     });
 
     // Parse response
     let response, sessionId;
     try {
       const parsed = JSON.parse(result);
-      response = parsed.result || result;
+      response = parsed.result ?? result;
       sessionId = parsed.session_id;
     } catch {
       response = result.trim();
@@ -432,6 +477,26 @@ api.post("/send", async (req, res) => {
     // Store sent message in DB
     stmtInsert.run(chatId, phone, "me", message, new Date().toISOString(), 1, 1);
 
+    res.json({ ok: true, sent_to: phone });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Send voice note endpoint ---
+api.post("/send-voice", async (req, res) => {
+  const { phone, file_path } = req.body;
+  if (!phone || !file_path) {
+    return res.status(400).json({ error: "phone and file_path required" });
+  }
+  if (!isReady) {
+    return res.status(503).json({ error: "WhatsApp not connected" });
+  }
+  try {
+    let chatId = jidMap[phone] || `${phone}@c.us`;
+    const media = MessageMedia.fromFilePath(file_path);
+    await waClient.sendMessage(chatId, media, { sendAudioAsVoice: true });
+    stmtInsert.run(chatId, phone, "me", "[Nota de voz enviada]", new Date().toISOString(), 1, 1);
     res.json({ ok: true, sent_to: phone });
   } catch (err) {
     res.status(500).json({ error: err.message });

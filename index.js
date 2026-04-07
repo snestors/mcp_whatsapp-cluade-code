@@ -21,7 +21,7 @@ async function api(path, options = {}) {
   return res.json();
 }
 
-const server = new McpServer({ name: "whatsapp", version: "2.1.0" });
+const server = new McpServer({ name: "whatsapp", version: "2.0.0" });
 
 server.tool("send_message", "Send a WhatsApp message to a phone number", {
   phone: z.string().describe("Phone with country code e.g. 51922743968"),
@@ -95,6 +95,40 @@ server.tool("get_status", "Check WhatsApp connection status", {}, async () => {
     return { content: [{ type: "text", text: "WhatsApp Bridge not running." }], isError: true };
   }
 });
+
+// --- Health monitor: restart bridge if it dies ---
+const HEALTH_CHECK_INTERVAL = 60_000; // every 60s
+let healthCheckTimer = null;
+
+async function checkBridgeHealth() {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(`${API_URL}/status`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.connected) {
+      console.error("[mcp] Bridge reports disconnected, restarting...");
+      await restartBridge();
+    }
+  } catch (err) {
+    console.error(`[mcp] Bridge health check failed: ${err.message}, restarting...`);
+    await restartBridge();
+  }
+}
+
+async function restartBridge() {
+  try {
+    const { execSync } = await import("child_process");
+    execSync("sudo systemctl restart whatsapp-bridge.service", { timeout: 30000 });
+    console.error("[mcp] Bridge restarted successfully");
+  } catch (err) {
+    console.error(`[mcp] Failed to restart bridge: ${err.message}`);
+  }
+}
+
+healthCheckTimer = setInterval(checkBridgeHealth, HEALTH_CHECK_INTERVAL);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
