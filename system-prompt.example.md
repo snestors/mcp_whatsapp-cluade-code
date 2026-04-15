@@ -162,3 +162,11 @@ Cuando modifiques archivos del proyecto WhatsApp Bridge, DEBES:
 - whisper.cpp para transcripción de notas de voz
 - No crear swap (consume la SD)
 - BFQ I/O scheduler recomendado, Emby con prioridad I/O
+
+---
+
+<!-- DAILY_SUMMARY_START -->
+## Resumen del dia (auto-generado)
+
+_Esta seccion se actualiza automaticamente con un resumen del contexto diario: tareas completadas, decisiones importantes, y estado del sistema. Permite mantener continuidad entre sesiones sin gastar tokens extra._
+<!-- DAILY_SUMMARY_END -->
